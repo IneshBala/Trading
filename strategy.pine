@@ -200,10 +200,12 @@ if sz > 0
             if not na(bx)
                 box.set_right(bx, bar_index)
             bool isTradeActiveForThisZone = false
-            for trade_idx = 0 to array.size(active_trade_ids) - 1
-                if array.get(active_trade_zone_indices, trade_idx) == i
-                    isTradeActiveForThisZone := true
-                    break
+            int activeTradeCount = array.size(active_trade_ids)
+            if activeTradeCount > 0
+                for trade_idx = 0 to activeTradeCount - 1
+                    if array.get(active_trade_zone_indices, trade_idx) == i
+                        isTradeActiveForThisZone := true
+                        break
             if okToTrade and not isTradeActiveForThisZone and inDateRange and currentTouch and barstate.isconfirmed
                 float newStopLoss = na
                 float newTakeProfit = na
