@@ -288,8 +288,9 @@ if sz > 0
 // Custom Trade Ledger Table
 // =============================================================================
 if barstate.islast and showLedger
-    var table tradeTable = table.new(position.top_right, 7, 20, bgcolor = color.new(color.gray, 80), border_width = 1)
-    table.clear(tradeTable, 0, 0, 6, 19)
+    const int ledger_rows = 20
+    var table tradeTable = table.new(position.top_right, 7, ledger_rows, bgcolor = color.new(color.gray, 80), border_width = 1)
+    table.clear(tradeTable, 0, 0, 6, ledger_rows - 1)
     add_cell(tradeTable, 0, 0, "ID", color.new(color.black, 50))
     add_cell(tradeTable, 1, 0, "Entry Date", color.new(color.black, 50))
     add_cell(tradeTable, 2, 0, "Entry Price", color.new(color.black, 50))
@@ -300,6 +301,8 @@ if barstate.islast and showLedger
 
     int row = 1
     for i = 0 to array.size(closed_trade_ids) - 1
+        if row >= ledger_rows
+            break
         string entry_id_full = array.get(closed_trade_ids, i)
         string entry_id_base = entry_id_full
         int at_pos = str.pos(entry_id_full, "@")
@@ -321,6 +324,8 @@ if barstate.islast and showLedger
         row += 1
 
     for i = 0 to array.size(active_trade_ids) - 1
+        if row >= ledger_rows
+            break
         string fullId = array.get(active_trade_ids, i)
         string baseId = fullId
         int at_pos_open = str.pos(fullId, "@")
