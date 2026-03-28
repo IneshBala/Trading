@@ -1,0 +1,347 @@
+//@version=6
+// Final, Re-architected Version by Gemini
+strategy("BT_Autoresistance_Gemini",
+     overlay=true,
+     initial_capital=100000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10,
+     pyramiding=20, 
+     process_orders_on_close = true,
+     calc_on_every_tick = true)
+
+// =============================================================================
+// Indicator Settings
+// =============================================================================
+leftBars  = input.int(10,  "Pivot Left",  minval=1, group="Indicator Settings")
+rightBars = input.int(10,  "Pivot Right", minval=1, group="Indicator Settings")
+breachPct = input.float(2.0,  "Stop resistance if Close > Level by (%)", minval=0.1, step=0.1, group="Indicator Settings")
+drawdownPct = input.float(30.0, "Confirm resistance after drawdown (%)", minval=1.0, step=0.5, group="Indicator Settings")
+minBars   = input.int(60, "Minimum bars before H1 allowed", minval=1, group="Indicator Settings")
+resColor  = input.color(color.red, "Resistance Color", group="Indicator Settings")
+lineWidth = input.int(2, "Resistance Line Width", minval=1, maxval=4, group="Indicator Settings")
+preConfirmTransparency = input.int(60, "Resistance pre-confirm transparency", minval=0, maxval=100, group="Indicator Settings")
+showLabels = input.bool(true, "Show H1/H2/H3 labels", group="Indicator Settings")
+showCustomLabels = input.bool(true, "Show custom labels with price", group="Indicator Settings")
+capPct    = input.float(3.0,  "Buy Zone cap % from low", minval=0.1, step=0.1, group="Indicator Settings")
+minGapPct = input.float(15.0, "Min gap between Buy Zones (%)", minval=0.1, step=0.1, group="Indicator Settings")
+rallyPct = input.float(10.0, "Rally % to confirm a touch cycle", minval=1, step=0.5, group="Indicator Settings")
+maxTouches = input.int(2, "Max touch/rally cycles before zone expires", minval=1, step=1, group="Indicator Settings")
+
+// =============================================================================
+// Strategy Settings
+// =============================================================================
+bool dailyTfOnly = input.bool(true, "Run on Daily Timeframe Only?", group="Strategy Settings")
+bool useAveraging = input.bool(true, "Use Averaging Down Entry?", group="Strategy Settings")
+float avgDrawdownPct = input.float(20.0, "Averaging Drawdown %", minval=1.0, group="Strategy Settings")
+string exitType = input.string("Percentage Based", "Exit Method", options=["Zone Based", "Percentage Based"], group="Strategy Settings")
+float rrRatio = input.float(1.5, "Take Profit RR Ratio (for Zone Based)", group="Strategy Settings", step=0.1, minval=0.1)
+float slPct = input.float(70.0, "Stop Loss % (for Percentage Based)", group="Strategy Settings", step=0.1, minval=0.1)
+float tpPct = input.float(12.0, "Take Profit % (for Percentage Based)", group="Strategy Settings", step=0.1, minval=0.1)
+bool useTakeProfit = input.bool(true, "Use Take Profit?", group="Strategy Settings")
+bool useMaxTouchesExit = input.bool(true, "Exit on Max Touches?", group="Strategy Settings")
+
+// =============================================================================
+// Backtesting Time Range & Ledger
+// =============================================================================
+string visual_group = "Visuals & Ledger"
+bool showLedger = input.bool(true, "Show Trade Ledger?", group = visual_group)
+string time_range_group = "Backtesting Time Range"
+int i_startTime = input.time(timestamp("01 Jan 2023 00:00 +0000"), "Start Date", group = time_range_group)
+int i_endTime = input.time(timestamp("31 Dec 2025 23:59 +0000"), "End Date", group = time_range_group)
+bool inDateRange = time >= i_startTime and time <= i_endTime
+
+// =============================================================================
+// Helper Function for Table
+// =============================================================================
+add_cell(table t, int col, int row, string txt, color bg) =>
+    table.cell(t, col, row, txt, text_color=color.white, bgcolor=bg)
+
+// =============================================================================
+// Data Structure Initialization
+// =============================================================================
+var line[] lines = array.new_line()
+var float[] levels = array.new_float()
+var int[] starts = array.new_int()
+var bool[] alive = array.new_bool()
+var float[] minLows = array.new_float()
+var bool[] confirmed = array.new_bool()
+var int[] phase = array.new_int()
+var int[] breachBarIdx = array.new_int()
+var label[] labelsH1 = array.new_label()
+var label[] labelsH2 = array.new_label()
+var label[] labelsH3 = array.new_label()
+var float[] h2Price = array.new_float()
+var int[] h2BarIdx = array.new_int()
+var box[] buyBox = array.new_box()
+var float[] buyLow = array.new_float()
+var float[] buyHigh = array.new_float()
+var int[] buyStartIdx = array.new_int()
+var bool[] buyActive = array.new_bool()
+var int[] touchCount = array.new_int()
+var bool[] touchOccurred = array.new_bool()
+var bool[] hasAveraged = array.new_bool()
+
+var int tradeCounter = 0
+var string[] active_trade_ids = array.new_string()
+var int[] active_trade_zone_indices = array.new_int()
+var float[] active_trade_entry_prices = array.new_float()
+var int[] active_trade_entry_times = array.new_int()
+var float[] active_trade_sls = array.new_float()
+var float[] active_trade_tps = array.new_float()
+
+var string[] closed_trade_ids = array.new_string()
+var int[] closed_trade_entry_times = array.new_int()
+var float[] closed_trade_entry_prices = array.new_float()
+var int[] closed_trade_exit_times = array.new_int()
+var float[] closed_trade_exit_prices = array.new_float()
+var float[] closed_trade_tp_prices = array.new_float()
+
+// =============================================================================
+// Core Logic
+// =============================================================================
+bool okToTrade = not dailyTfOnly or timeframe.isdaily
+
+float ph = ta.pivothigh(high, leftBars, rightBars)
+if not na(ph)
+    int pivotIndex = bar_index - rightBars
+    if pivotIndex + 1 >= minBars
+        line newLine = line.new(pivotIndex, ph, bar_index, ph, xloc=xloc.bar_index, extend=extend.right, color=color.new(resColor, preConfirmTransparency), width=lineWidth, style=line.style_dotted)
+        array.push(lines, newLine)
+        array.push(levels, ph)
+        array.push(starts, pivotIndex)
+        array.push(alive, true)
+        array.push(minLows, low)
+        array.push(confirmed, false)
+        array.push(phase, 0)
+        array.push(breachBarIdx, na)
+        label newLabelH1 = showLabels ? label.new(pivotIndex, ph, showCustomLabels ? "H1@" + str.tostring(ph, "#.##") : "H1", style=label.style_label_down, textcolor=color.white, color=color.new(color.orange, 0)) : na
+        array.push(labelsH1, newLabelH1)
+        array.push(labelsH2, na)
+        array.push(labelsH3, na)
+        array.push(h2Price, na)
+        array.push(h2BarIdx, na)
+        array.push(buyBox, na)
+        array.push(buyLow, na)
+        array.push(buyHigh, na)
+        array.push(buyStartIdx, na)
+        array.push(buyActive, false)
+        array.push(touchCount, 0)
+        array.push(touchOccurred, false)
+        array.push(hasAveraged, false)
+
+int sz = array.size(lines)
+if sz > 0
+    // --- Zone State Management Loop ---
+    for i = 0 to sz - 1
+        float lvl_res = array.get(levels, i)
+        if array.get(alive, i) and barstate.isconfirmed and close > lvl_res * (1 + breachPct/100.0)
+            line currentLine = array.get(lines, i)
+            line.set_extend(currentLine, extend.none)
+            line.set_x2(currentLine, bar_index)
+            array.set(alive, i, false)
+            if array.get(phase, i) == 0
+                array.set(phase, i, 1)
+                array.set(breachBarIdx, i, bar_index)
+        if array.get(alive, i)
+            array.set(minLows, i, math.min(array.get(minLows, i), low))
+            bool isConfirmed = array.get(confirmed, i) or array.get(minLows, i) <= lvl_res * (1 - drawdownPct/100.0)
+            if isConfirmed and not array.get(confirmed, i) and barstate.isconfirmed
+                line currentLineConfirm = array.get(lines, i)
+                line.set_style(currentLineConfirm, line.style_solid)
+                line.set_color(currentLineConfirm, color.new(resColor, 0))
+                array.set(confirmed, i, true)
+        if not na(ph) and array.get(phase, i) == 1 and (bar_index - rightBars) >= array.get(breachBarIdx, i) and (bar_index - rightBars) > array.get(starts, i) and ph > lvl_res
+            if showLabels
+                label newLabelH2 = label.new(bar_index - rightBars, ph, showCustomLabels ? "H2@" + str.tostring(ph, "#.##") : "H2", style=label.style_label_up, textcolor=color.white, color=color.new(color.teal, 0))
+                array.set(labelsH2, i, newLabelH2)
+            array.set(h2Price, i, ph)
+            array.set(h2BarIdx, i, bar_index - rightBars)
+            array.set(phase, i, 2)
+
+        if array.get(phase, i) == 2
+            float h2p = array.get(h2Price, i)
+            int h2bx = array.get(h2BarIdx, i)
+            if not na(h2p) and bar_index > h2bx and close > h2p and barstate.isconfirmed
+                if showLabels
+                    label newLabelH3 = label.new(bar_index, high, showCustomLabels ? "H3@" + str.tostring(close, "#.##") : "H3", style=label.style_label_up, textcolor=color.white, color=color.new(color.fuchsia, 0))
+                    array.set(labelsH3, i, newLabelH3)
+                float minLow = na
+                int minOff = na
+                for n = 1 to bar_index - h2bx - 1
+                    if na(minLow) or low[n] < minLow or (low[n] == minLow and n > minOff)
+                        minLow := low[n]
+                        minOff := n
+                if not na(minOff)
+                    float useTop = high[minOff] < minLow * (1 + capPct/100.0) ? high[minOff] : minLow * (1 + capPct/100.0)
+                    bool okGap = true
+                    for j = 0 to sz - 1
+                        if array.get(buyActive, j) and ((array.get(buyHigh, j) < minLow ? minLow - array.get(buyHigh, j) : (useTop < array.get(buyLow, j) ? array.get(buyLow, j) - useTop : 0.0)) / math.min(array.get(buyLow, j), minLow)) * 100.0 < minGapPct
+                            okGap := false
+                    if okGap
+                        box newBox = box.new(bar_index - minOff, useTop, bar_index, minLow, xloc=xloc.bar_index, border_color=color.new(color.teal, 0), bgcolor=color.new(color.teal, 85))
+                        array.set(buyBox, i, newBox)
+                        array.set(buyLow, i, minLow)
+                        array.set(buyHigh, i, useTop)
+                        array.set(buyStartIdx, i, bar_index - minOff)
+                        array.set(buyActive, i, true)
+                array.set(phase, i, 3)
+
+        if array.get(phase, i) >= 3 and array.get(buyActive, i)
+            box bx = array.get(buyBox, i)
+            float zl = array.get(buyLow, i)
+            float zh = array.get(buyHigh, i)
+            bool currentTouch = low <= zh and high >= zl
+            if barstate.isconfirmed
+                if not array.get(touchOccurred, i) and currentTouch
+                    array.set(touchOccurred, i, true)
+                if array.get(touchOccurred, i) and high >= zh * (1 + rallyPct / 100.0)
+                    array.set(touchCount, i, array.get(touchCount, i) + 1)
+                    array.set(touchOccurred, i, false)
+            if not na(bx)
+                box.set_right(bx, bar_index)
+            bool isTradeActiveForThisZone = false
+            int activeTradeCount = array.size(active_trade_ids)
+            if activeTradeCount > 0
+                for trade_idx = 0 to activeTradeCount - 1
+                    if array.get(active_trade_zone_indices, trade_idx) == i
+                        isTradeActiveForThisZone := true
+                        break
+            if okToTrade and not isTradeActiveForThisZone and inDateRange and currentTouch and barstate.isconfirmed
+                float newStopLoss = na
+                float newTakeProfit = na
+                if exitType == "Zone Based"
+                    newStopLoss := zl
+                    newTakeProfit := useTakeProfit ? close + (close - newStopLoss) * rrRatio : na
+                else
+                    newStopLoss := close * (1 - slPct / 100)
+                    newTakeProfit := useTakeProfit ? close * (1 + tpPct / 100) : na
+                tradeCounter += 1
+                string newTradeId = "L-" + str.tostring(tradeCounter)
+                strategy.entry(newTradeId, strategy.long)
+                array.push(active_trade_ids, newTradeId)
+                array.push(active_trade_zone_indices, i)
+                array.push(active_trade_entry_prices, close)
+                array.push(active_trade_entry_times, time)
+                array.push(active_trade_sls, newStopLoss)
+                array.push(active_trade_tps, newTakeProfit)
+
+            if barstate.isconfirmed and (close < zl or array.get(touchCount, i) >= maxTouches)
+                if not na(bx)
+                    box.set_border_color(bx, color.new(color.gray, 50))
+                    box.set_bgcolor(bx, color.new(color.gray, 90))
+                array.set(buyActive, i, false)
+
+    // --- Unified Trade Management Loop ---
+    if okToTrade and array.size(active_trade_ids) > 0
+        for i = array.size(active_trade_ids) - 1 to 0 by -1
+            string tradeId = array.get(active_trade_ids, i)
+            int zone_idx = array.get(active_trade_zone_indices, i)
+            float stopLoss = array.get(active_trade_sls, i)
+            float takeProfit = array.get(active_trade_tps, i)
+            float entryPrice = array.get(active_trade_entry_prices, i)
+
+            bool stopLossHit = low <= stopLoss
+            bool takeProfitHit = useTakeProfit and not na(takeProfit) and high >= takeProfit
+
+            bool maxTouchesHit = false
+            if zone_idx != -1 and useMaxTouchesExit and barstate.isconfirmed and zone_idx < array.size(touchCount)
+                if array.get(touchCount, zone_idx) >= maxTouches
+                    maxTouchesHit := true
+
+            if stopLossHit or takeProfitHit or maxTouchesHit
+                float exitPrice = close
+                if takeProfitHit
+                    exitPrice := takeProfit
+                else if stopLossHit
+                    exitPrice := stopLoss
+                strategy.close(tradeId, comment=stopLossHit ? "SL" : takeProfitHit ? "TP" : "Max Touches")
+                array.push(closed_trade_ids, tradeId)
+                array.push(closed_trade_entry_times, array.get(active_trade_entry_times, i))
+                array.push(closed_trade_entry_prices, entryPrice)
+                array.push(closed_trade_exit_times, time)
+                array.push(closed_trade_exit_prices, exitPrice)
+                array.push(closed_trade_tp_prices, takeProfit)
+                if zone_idx != -1 and zone_idx < array.size(hasAveraged)
+                    array.set(hasAveraged, zone_idx, false)
+                array.remove(active_trade_ids, i)
+                array.remove(active_trade_zone_indices, i)
+                array.remove(active_trade_entry_prices, i)
+                array.remove(active_trade_entry_times, i)
+                array.remove(active_trade_sls, i)
+                array.remove(active_trade_tps, i)
+            else if useAveraging and zone_idx != -1 and zone_idx < array.size(hasAveraged) and not array.get(hasAveraged, zone_idx) and barstate.isconfirmed and close < entryPrice * (1 - avgDrawdownPct / 100)
+                array.set(hasAveraged, zone_idx, true)
+                tradeCounter += 1
+                string avgTradeId = "A-" + str.tostring(tradeCounter)
+                strategy.entry(avgTradeId, strategy.long)
+                float avg_entry_price = close
+                float avg_sl = avg_entry_price * (1 - slPct / 100)
+                float avg_tp = useTakeProfit ? avg_entry_price * (1 + tpPct / 100) : na
+                array.push(active_trade_ids, avgTradeId)
+                array.push(active_trade_zone_indices, -1)
+                array.push(active_trade_entry_prices, avg_entry_price)
+                array.push(active_trade_entry_times, time)
+                array.push(active_trade_sls, avg_sl)
+                array.push(active_trade_tps, avg_tp)
+
+// =============================================================================
+// Custom Trade Ledger Table
+// =============================================================================
+if barstate.islast and showLedger
+    const int ledger_rows = 20
+    var table tradeTable = table.new(position.top_right, 7, ledger_rows, bgcolor = color.new(color.gray, 80), border_width = 1)
+    table.clear(tradeTable, 0, 0, 6, ledger_rows - 1)
+    add_cell(tradeTable, 0, 0, "ID", color.new(color.black, 50))
+    add_cell(tradeTable, 1, 0, "Entry Date", color.new(color.black, 50))
+    add_cell(tradeTable, 2, 0, "Entry Price", color.new(color.black, 50))
+    add_cell(tradeTable, 3, 0, "Status", color.new(color.black, 50))
+    add_cell(tradeTable, 4, 0, "P/L %", color.new(color.black, 50))
+    add_cell(tradeTable, 5, 0, "TP Price", color.new(color.black, 50))
+    add_cell(tradeTable, 6, 0, "Exit Date", color.new(color.black, 50))
+
+    int row = 1
+    for i = 0 to array.size(closed_trade_ids) - 1
+        if row >= ledger_rows
+            break
+        string entry_id_full = array.get(closed_trade_ids, i)
+        string entry_id_base = entry_id_full
+        int at_pos = str.pos(entry_id_full, "@")
+        if at_pos > -1
+            entry_id_base := str.substring(entry_id_full, 0, at_pos)
+
+        add_cell(tradeTable, 0, row, entry_id_base, color.gray)
+        add_cell(tradeTable, 1, row, str.format_time(array.get(closed_trade_entry_times, i), "dd-MMM-yy"), color.gray)
+        add_cell(tradeTable, 2, row, str.tostring(array.get(closed_trade_entry_prices, i), "#.##"), color.gray)
+        add_cell(tradeTable, 3, row, "Closed", color.gray)
+        float entry_price = array.get(closed_trade_entry_prices, i)
+        float exit_price = array.get(closed_trade_exit_prices, i)
+        float pnl_pct = (exit_price - entry_price) / entry_price * 100
+        color pnl_color = pnl_pct >= 0 ? color.new(color.green, 40) : color.new(color.red, 40)
+        float tp_price = array.get(closed_trade_tp_prices, i)
+        add_cell(tradeTable, 4, row, str.tostring(pnl_pct, "#.##") + "%", pnl_color)
+        add_cell(tradeTable, 5, row, str.tostring(tp_price, "#.##"), color.gray)
+        add_cell(tradeTable, 6, row, str.format_time(array.get(closed_trade_exit_times, i), "dd-MMM-yy"), color.gray)
+        row += 1
+
+    for i = 0 to array.size(active_trade_ids) - 1
+        if row >= ledger_rows
+            break
+        string fullId = array.get(active_trade_ids, i)
+        string baseId = fullId
+        int at_pos_open = str.pos(fullId, "@")
+        if at_pos_open > -1
+            baseId := str.substring(fullId, 0, at_pos_open)
+
+        float entry_price_open = array.get(active_trade_entry_prices, i)
+        add_cell(tradeTable, 0, row, baseId, color.gray)
+        add_cell(tradeTable, 1, row, str.format_time(array.get(active_trade_entry_times, i), "dd-MMM-yy"), color.gray)
+        add_cell(tradeTable, 2, row, str.tostring(entry_price_open, "#.##"), color.gray)
+        color status_color = str.contains(baseId, "A-") ? color.new(color.purple, 40) : color.new(color.blue, 40)
+        string status_text = str.contains(baseId, "A-") ? "Active (Avg)" : "Active"
+        add_cell(tradeTable, 3, row, status_text, status_color)
+        float pnl_pct_open = (close - entry_price_open) / entry_price_open * 100
+        color pnl_color_open = pnl_pct_open >= 0 ? color.green : color.red
+        add_cell(tradeTable, 4, row, str.tostring(pnl_pct_open, "#.##") + "%", color.new(pnl_color_open, 40))
+        add_cell(tradeTable, 5, row, str.tostring(array.get(active_trade_tps, i), "#.##"), color.gray)
+        add_cell(tradeTable, 6, row, "N/A", color.gray)
+        row += 1
